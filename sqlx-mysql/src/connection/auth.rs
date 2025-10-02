@@ -2,8 +2,8 @@ use bytes::buf::Chain;
 use bytes::Bytes;
 use digest::{Digest, OutputSizeUser};
 use generic_array::GenericArray;
-use rand::thread_rng;
-use rsa::{pkcs8::DecodePublicKey, Oaep, RsaPublicKey};
+// use rand::thread_rng;  // No longer needed without RSA
+// use rsa::{pkcs8::DecodePublicKey, Oaep, RsaPublicKey};  // Removed to eliminate RSA vulnerability
 use sha1::Sha1;
 use sha2::Sha256;
 
@@ -26,7 +26,8 @@ impl AuthPlugin {
             AuthPlugin::MySqlNativePassword => Ok(scramble_sha1(password, nonce).to_vec()),
 
             // https://mariadb.com/kb/en/sha256_password-plugin/
-            AuthPlugin::Sha256Password => encrypt_rsa(stream, 0x01, password, nonce).await,
+            // RSA encryption removed due to security vulnerability (RUSTSEC-2023-0071)
+            AuthPlugin::Sha256Password => encrypt_tls_only(stream, password).await,
 
             AuthPlugin::MySqlClearPassword => {
                 let mut pw_bytes = password.as_bytes().to_owned();
@@ -41,7 +42,7 @@ impl AuthPlugin {
         stream: &mut MySqlStream,
         packet: Packet<Bytes>,
         password: &str,
-        nonce: &Chain<Bytes, Bytes>,
+        _nonce: &Chain<Bytes, Bytes>,  // Unused since RSA encryption was removed
     ) -> Result<bool, Error> {
         match self {
             AuthPlugin::CachingSha2Password if packet[0] == 0x01 => {
@@ -51,7 +52,7 @@ impl AuthPlugin {
 
                     // AUTH_CONTINUE
                     0x04 => {
-                        let payload = encrypt_rsa(stream, 0x02, password, nonce).await?;
+                        let payload = encrypt_tls_only(stream, password).await?;
 
                         stream.write_packet(&*payload)?;
                         stream.flush().await?;
@@ -129,12 +130,11 @@ fn scramble_sha256(
     pw_hash
 }
 
-async fn encrypt_rsa<'s>(
+async fn encrypt_tls_only<'s>(
     stream: &'s mut MySqlStream,
-    public_key_request_id: u8,
     password: &'s str,
-    nonce: &'s Chain<Bytes, Bytes>,
 ) -> Result<Vec<u8>, Error> {
+    // TLS-only implementation to avoid RSA vulnerability (RUSTSEC-2023-0071)
     // https://mariadb.com/kb/en/caching_sha2_password-authentication-plugin/
 
     if stream.is_tls {
@@ -142,29 +142,13 @@ async fn encrypt_rsa<'s>(
         return Ok(to_asciz(password));
     }
 
-    // client sends a public key request
-    stream.write_packet(&[public_key_request_id][..])?;
-    stream.flush().await?;
-
-    // server sends a public key response
-    let packet = stream.recv_packet().await?;
-    let rsa_pub_key = &packet[1..];
-
-    // xor the password with the given nonce
-    let mut pass = to_asciz(password);
-
-    let (a, b) = (nonce.first_ref(), nonce.last_ref());
-    let mut nonce = Vec::with_capacity(a.len() + b.len());
-    nonce.extend_from_slice(a);
-    nonce.extend_from_slice(b);
-
-    xor_eq(&mut pass, &nonce);
-
-    // client sends an RSA encrypted password
-    let pkey = parse_rsa_pub_key(rsa_pub_key)?;
-    let padding = Oaep::new::<sha1::Sha1>();
-    pkey.encrypt(&mut thread_rng(), padding, &pass[..])
-        .map_err(Error::protocol)
+    // For non-TLS connections, RSA encryption has been removed due to security concerns.
+    // Return an error requiring TLS connection for secure authentication.
+    Err(Error::protocol(
+        "RSA password encryption has been disabled due to security vulnerability (RUSTSEC-2023-0071). \
+         Please use TLS connections for Sha256Password or CachingSha2Password authentication. \
+         Consider using MySqlNativePassword or enable TLS/SSL for your MySQL connection."
+    ))
 }
 
 // XOR(x, y)
@@ -185,13 +169,5 @@ fn to_asciz(s: &str) -> Vec<u8> {
     z.into_bytes()
 }
 
-// https://docs.rs/rsa/0.3.0/rsa/struct.RSAPublicKey.html?search=#example-1
-fn parse_rsa_pub_key(key: &[u8]) -> Result<RsaPublicKey, Error> {
-    let pem = std::str::from_utf8(key).map_err(Error::protocol)?;
-
-    // This takes advantage of the knowledge that we know
-    // we are receiving a PKCS#8 RSA Public Key at all
-    // times from MySQL
-
-    RsaPublicKey::from_public_key_pem(pem).map_err(Error::protocol)
-}
+// RSA public key parsing function removed due to RSA vulnerability (RUSTSEC-2023-0071)
+// fn parse_rsa_pub_key(key: &[u8]) -> Result<RsaPublicKey, Error> { ... }
