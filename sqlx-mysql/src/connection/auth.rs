@@ -42,7 +42,6 @@ impl AuthPlugin {
         stream: &mut MySqlStream,
         packet: Packet<Bytes>,
         password: &str,
-        _nonce: &Chain<Bytes, Bytes>,  // Unused since RSA encryption was removed
     ) -> Result<bool, Error> {
         match self {
             AuthPlugin::CachingSha2Password if packet[0] == 0x01 => {
